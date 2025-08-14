@@ -38,7 +38,7 @@ from model import ModelConfig, GptOssModel, calculate_params
 # --- Configuration -----------------------------------------------------------------
 
 # Training hyperparameters
-model_size = 'gpt2-124m' # or 'gpt-oss-120b'
+model_size = 'nano-gpt' # or 'gpt-oss-120b'
 data_dir = 'data/tinystories'
 out_dir = 'out'
 # ---
@@ -84,7 +84,7 @@ torch.manual_seed(1337)
 # --- Data Loading ------------------------------------------------------------
 def get_batch(split):
     # Use memory-mapped files for efficient access
-    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint32, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data[i+1:i+block_size+1].astype(np.int64)) for i in ix])
@@ -96,7 +96,7 @@ def get_config(size: str) -> ModelConfig:
     """
     Returns a ModelConfig instance for a specified model size.
     """
-    if size == 'gpt2-124m':
+    if size == 'nano-gpt':
         # This is a config for a 124M parameter model, very close to GPT-2 small.
         # It's a non-MoE, non-GQA model for simple and fast testing.
         return ModelConfig(
@@ -105,31 +105,14 @@ def get_config(size: str) -> ModelConfig:
             num_key_value_heads=12,   # No GQA, so n_kv_head == n_head
             hidden_size=768,
             head_dim=64,              # hidden_size / num_attention_heads = 768 / 12 = 64
-            intermediate_size=3072,   # 4 * hidden_size, standard for GPT-2
+            intermediate_size=3072,   # 4 * hidden_size
             num_local_experts=1,      # A "1-expert MoE" is just a standard dense FFN
             experts_per_token=1,
-            vocab_size=50257,         # Standard GPT-2 vocab size
-            max_position_embeddings=1024, # Standard GPT-2 context length
+            vocab_size=201088,         
+            max_position_embeddings=1024,
             block_size=1024,          # Use the full context length for this model
             # For a non-SWA model, all layers are full attention
             layer_types=['full_attention'] * 12,
-        )
-    elif size == 'gpt2-155m':
-        # This is a slightly larger GPT-2 Small-ish config (kept for reference)
-        return ModelConfig(
-            num_hidden_layers=12,
-            num_attention_heads=12,
-            num_key_value_heads=12,
-            hidden_size=768,
-            head_dim=64,
-            intermediate_size=3072,
-            num_local_experts=1,
-            experts_per_token=1,
-            vocab_size=50257,
-            max_position_embeddings=1024,
-            sliding_window=1024,
-            layer_types=['full_attention'] * 12,
-            block_size=1024,
         )
     elif size == 'gpt-oss-120b':
         # The full model config from model.py

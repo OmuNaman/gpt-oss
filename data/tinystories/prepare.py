@@ -3,7 +3,7 @@ Downloads and tokenizes the TinyStories dataset.
 
 This script follows the nanoGPT repository's data preparation methodology.
 1.  Downloads the TinyStories dataset from Hugging Face.
-2.  Tokenizes the text using the 'gpt2' tokenizer via tiktoken.
+2.  Tokenizes the text using the 'o200k_base' tokenizer via tiktoken.
 3.  Concatenates all stories into a single stream of tokens, separated by <|endoftext|>.
 4.  Splits the token stream into a training set (90%) and a validation set (10%).
 5.  Saves the token arrays to binary files (`train.bin` and `val.bin`) in the
@@ -29,8 +29,8 @@ def main():
     dataset = load_dataset(dataset_name, split="train")
 
     # --- 2. Initialize the tokenizer ---
-    print("Initializing 'gpt2' tokenizer...")
-    enc = tiktoken.get_encoding("gpt2")
+    print("Initializing 'o200k' tokenizer...")
+    enc = tiktoken.get_encoding("o200k_harmony")
     eot_token = enc.eot_token # The End-Of-Text token ID
 
     def tokenize_and_separate(example):
@@ -50,8 +50,8 @@ def main():
         all_tokens.extend(story_tokens)
 
     # Convert the Python list to a NumPy array for efficiency
-    # Use uint16 since gpt2 vocab_size is 50257, which fits in 16 bits
-    all_tokens_np = np.array(all_tokens, dtype=np.uint16)
+    # Use uint16 since gpt2 vocab_size is 50257, which does not fits in 16 bits
+    all_tokens_np = np.array(all_tokens, dtype=np.uint32)
     print(f"Total tokens in the dataset: {len(all_tokens_np):,}")
 
     # --- 4. Split into training and validation sets ---

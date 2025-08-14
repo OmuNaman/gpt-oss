@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
     # --- 3. Initialize Tokenizer ---
     # The tokenizer must match the one used during training.
-    enc = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("o200k_base")
     
     # Encode the starting prompt
     start_ids = enc.encode(start, allowed_special={'<|endoftext|>'})
