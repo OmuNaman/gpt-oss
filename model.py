@@ -57,6 +57,7 @@ class ModelConfig:
     initializer_range: float = 0.02
     tie_word_embeddings: bool = False
     dropout: float = 0.0
+    eos_token_id: Optional[int] = None
 
     def __post_init__(self):
         """Post-initialization checks and setup."""
@@ -529,10 +530,11 @@ def calculate_params_from_config(config: GPTConfig) -> dict:
     }
 
 
-# 4. Now, run the calculation
-config_120b = GPTConfig()
-params = calculate_params_from_config(config_120b)
-print(f"Total Theoretical Parameters: {params['total_B']:.2f}B")
-print(f"Active Theoretical Parameters: {params['active_B']:.2f}B")
-print(f"  - Total Expert Parameters: {params['expert_B']:.2f}B")
-print(f"  - Total Shared Parameters: {params['shared_B']:.2f}B")
+if __name__ == "__main__":
+    # 4. Now, run the calculation
+    config_120b = GPTConfig()
+    params = calculate_params_from_config(config_120b)
+    print(f"Total Theoretical Parameters: {params['total_B']:.2f}B")
+    print(f"Active Theoretical Parameters: {params['active_B']:.2f}B")
+    print(f"  - Total Expert Parameters: {params['expert_B']:.2f}B")
+    print(f"  - Total Shared Parameters: {params['shared_B']:.2f}B")

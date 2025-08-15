@@ -29,8 +29,8 @@ def main():
     dataset = load_dataset(dataset_name, split="train")
 
     # --- 2. Initialize the tokenizer ---
-    print("Initializing 'o200k' tokenizer...")
-    enc = tiktoken.get_encoding("o200k_harmony")
+    print("Initializing 'o200k_base' tokenizer...")
+    enc = tiktoken.get_encoding("o200k_base")
     eot_token = enc.eot_token # The End-Of-Text token ID
 
     def tokenize_and_separate(example):

@@ -21,7 +21,7 @@ import tiktoken
 from contextlib import nullcontext
 
 # Make sure model.py is in the same directory
-from model import GptOssModel, ModelConfig
+from model import Transformer, ModelConfig
 
 # --- Configuration -----------------------------------------------------------------
 out_dir = 'out'           # Checkpoint directory
@@ -56,7 +56,7 @@ if __name__ == "__main__":
             "Ensure you have run train.py to create a checkpoint."
         )
 
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
     # It's crucial to load the config from the checkpoint to ensure the model
     # architecture matches the trained weights.
@@ -64,7 +64,7 @@ if __name__ == "__main__":
     print("Model configuration loaded from checkpoint.")
 
     # --- 2. Build the Model ---
-    model = GptOssModel(model_config)
+    model = Transformer(model_config)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()  # Set the model to evaluation mode
     model.to(device)

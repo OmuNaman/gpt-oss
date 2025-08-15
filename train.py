@@ -33,12 +33,12 @@ import torch
 import tiktoken
 
 # (Make sure model.py is in the same directory)
-from model import ModelConfig, GptOssModel, calculate_params
+from model import ModelConfig, Transformer
 
 # --- Configuration -----------------------------------------------------------------
 
 # Training hyperparameters
-model_size = 'nano-gpt' # or 'gpt-oss-120b'
+model_size = 'gpt-oss-5b' # Test 5B model with same architecture as 120B
 data_dir = 'data/tinystories'
 out_dir = 'out'
 # ---
@@ -49,8 +49,8 @@ eval_iters = 200          # Number of batches for validation loss estimation
 always_save_checkpoint = True # if True, always save a checkpoint at the end of eval
 
 # Dataloader
-batch_size = 12
-block_size = 256 # Context length
+batch_size = 4           # Much smaller batch size for testing
+block_size = 128         # Smaller context length for testing
 
 # AdamW optimizer
 learning_rate = 6e-4
@@ -92,6 +92,12 @@ def get_batch(split):
     return x, y
 
 # --- Model Configurations ----------------------------------------------------
+def count_parameters(model):
+    """Count total and trainable parameters in the model."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params, trainable_params
+
 def get_config(size: str) -> ModelConfig:
     """
     Returns a ModelConfig instance for a specified model size.
@@ -100,19 +106,71 @@ def get_config(size: str) -> ModelConfig:
         # This is a config for a 124M parameter model, very close to GPT-2 small.
         # It's a non-MoE, non-GQA model for simple and fast testing.
         return ModelConfig(
-            num_hidden_layers=12,
-            num_attention_heads=12,
-            num_key_value_heads=12,   # No GQA, so n_kv_head == n_head
+            # Core dimensions - MUCH smaller
+            vocab_size=50257,             # Standard GPT-2 vocab size
             hidden_size=768,
-            head_dim=64,              # hidden_size / num_attention_heads = 768 / 12 = 64
-            intermediate_size=3072,   # 4 * hidden_size
-            num_local_experts=1,      # A "1-expert MoE" is just a standard dense FFN
+            num_hidden_layers=12,
+            intermediate_size=3072,       # 4 * hidden_size
+            
+            # Attention
+            num_attention_heads=12,
+            num_key_value_heads=12,       # No GQA, so n_kv_head == n_head
+            head_dim=64,                  # hidden_size / num_attention_heads = 768 / 12 = 64
+            
+            # Context & Position - MUCH smaller  
+            max_position_embeddings=1024, # Small context length
+            sliding_window=128,
+            
+            # MoE - Disable MoE completely
+            num_local_experts=1,          # A "1-expert MoE" is just a standard dense FFN
             experts_per_token=1,
-            vocab_size=201088,         
-            max_position_embeddings=1024,
-            block_size=1024,          # Use the full context length for this model
+            
             # For a non-SWA model, all layers are full attention
             layer_types=['full_attention'] * 12,
+            
+            # Other reasonable defaults
+            enable_sink_token=False,
+            attention_bias=True,
+            tie_word_embeddings=False,
+        )
+    elif size == 'gpt-oss-5b':
+        # TINY test version for debugging - probably ~500M parameters
+        # Same architecture as 120B but MUCH smaller dimensions for testing
+        return ModelConfig(
+            # Core dimensions - VERY small for testing
+            vocab_size=200019,        # o200k_base actual vocab size
+            hidden_size=256,          # MUCH smaller (vs 2880 in full model)
+            num_hidden_layers=8,      # MUCH fewer layers (vs 36 in full model)
+            intermediate_size=256,    # VERY small per expert (vs 2880 in full model)
+            
+            # Attention - tiny but keep GQA ratio
+            num_attention_heads=8,    # MUCH smaller (vs 64 in full model)
+            num_key_value_heads=2,    # MUCH smaller (vs 8 in full model, keep 4:1 ratio)
+            head_dim=32,              # 256/8 = 32
+            
+            # MoE - very few experts for testing
+            num_local_experts=4,      # MUCH fewer (vs 128 in full model)
+            experts_per_token=2,      # vs 4 in full model
+            
+            # Context - smaller for testing
+            max_position_embeddings=1024,  # MUCH smaller (vs 131072 in full model)
+            sliding_window=64,        # vs 128 in full model
+            
+            # Keep same architecture features
+            attention_bias=True,
+            enable_sink_token=False,
+            layer_types=None,  # Will auto-generate alternating pattern
+            
+            # Other settings
+            rope_theta=150_000.0,
+            router_aux_loss_coef=0.9,
+            hidden_act="silu",
+            swiglu_limit=7.0,
+            rms_norm_eps=1e-5,
+            initializer_range=0.02,
+            tie_word_embeddings=False,
+            dropout=0.0,
+            attention_dropout=0.0,
         )
     elif size == 'gpt-oss-120b':
         # The full model config from model.py
@@ -128,19 +186,17 @@ if __name__ == "__main__":
     # Get model config
     model_config = get_config(model_size)
     print(f"--- Training model: {model_size} ---")
-    
-    # Calculate and print parameter count
-    param_stats = calculate_params(model_config)
-    print(f"Total Parameters: {param_stats['total_B']:.2f}B")
-    print(f"Active Parameters: {param_stats['active_B']:.2f}B")
     print("-" * 30)
 
     # Gradient accumulation
     gradient_accumulation_steps = 8
     
     # Initialize model
-    model = GptOssModel(model_config)
+    model = Transformer(model_config)
     model.to(device)
+    
+    # Print model information
+    # print_model_info(model, model_size, max_iters)
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
@@ -176,10 +232,10 @@ if __name__ == "__main__":
     # Mixed precision training
     pt_dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=pt_dtype)
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
     # For decoding generated text
-    enc = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("o200k_base")
     
     # --- Training Loop ---
     X, Y = get_batch('train') # Fetch first batch
@@ -192,7 +248,7 @@ if __name__ == "__main__":
             param_group['lr'] = lr
 
         # --- Evaluation (Periodic) ---
-        if iter_num % eval_interval == 0:
+        if iter_num % eval_interval == 0 and iter_num > 0:  # Don't run validation at iter 0
             model.eval()
             print("\n--- Running Validation ---")
             
