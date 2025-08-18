@@ -1,321 +1,360 @@
+#!/usr/bin/env python3
 """
-A from-scratch training script for the GPT-OSS model.
+train.py — Training harness for GPT-OSS (toy or 20B config).
 
-This script is designed in the spirit of nanoGPT: a single, clear file
-that handles all aspects of training, from data loading to checkpointing
-and logging, while being easy to modify.
-
-It supports training models of different sizes and can be pointed to any
-pre-tokenized dataset.
-
-Key Features:
--   Configurable model sizes (e.g., a 155M test model).
--   Efficient data loading using memory-mapped numpy arrays.
--   Seamless checkpointing and resumption of training.
--   Periodic evaluation on a validation set.
--   Live text generation to monitor model progress.
--   Standard training utilities: AdamW, gradient accumulation, cosine LR decay.
-
-To run on a pre-tokenized dataset (like TinyStories):
-1.  Prepare the data:
-    python data/tinystories/prepare.py
-
-2.  Run the training script:
-    python train.py --model_size=gpt2-124m --data_dir=data/tinystories
+- Loads NanoGPT-style memmaps created by prepare.py (train.bin / val.bin / meta.json)
+- Uses tokenizer from meta.json (o200k_harmony preferred; falls back to o200k_base)
+- Saves a checkpoint every N iters (default 100)
+- Prints a short sample every N iters (default 100)
+- Evaluates periodically and saves on best val
+- Resumes from out/ckpt.pt if available
+- Uses modern AMP APIs (torch.amp.*)
 """
+import argparse
+import json
+import math
 import os
 import time
-import math
 from contextlib import nullcontext
 
 import numpy as np
 import torch
-import tiktoken
+import torch.nn.functional as F
 
-# (Make sure model.py is in the same directory)
-from model import ModelConfig, Transformer
+try:
+    import tiktoken
+except ImportError as e:
+    raise SystemExit("Please `pip install tiktoken` first.") from e
 
-# --- Configuration -----------------------------------------------------------------
+# Your model must be in the same folder
+from model import Transformer, ModelConfig, gpt_oss_20b_config
 
-# Training hyperparameters
-model_size = 'gpt-oss-5b' # Test 5B model with same architecture as 120B
-data_dir = 'data/tinystories'
-out_dir = 'out'
-# ---
-eval_interval = 250       # How often to run validation
-log_interval = 10         # How often to print training loss
-save_interval = 1000      # How often to save a checkpoint
-eval_iters = 200          # Number of batches for validation loss estimation
-always_save_checkpoint = True # if True, always save a checkpoint at the end of eval
 
-# Dataloader
-batch_size = 4           # Much smaller batch size for testing
-block_size = 128         # Smaller context length for testing
+# --------------------------------------------------------------------------- #
+# Args
+# --------------------------------------------------------------------------- #
 
-# AdamW optimizer
-learning_rate = 6e-4
-max_iters = 5000
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0
+def get_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, default="data/tinystories")
+    ap.add_argument("--out_dir", type=str, default="out")
+    ap.add_argument("--model_size", type=str, choices=["toy", "20b"], default="20b")
 
-# Learning rate decay settings
-decay_lr = True
-warmup_iters = 2000
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5
+    # Training hyperparams
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--block_size", type=int, default=512)    # train-time context (≤ model max)
+    ap.add_argument("--max_iters", type=int, default=2000)
+    ap.add_argument("--log_interval", type=int, default=10)
+    ap.add_argument("--eval_interval", type=int, default=500)
+    ap.add_argument("--eval_iters", type=int, default=200)
 
-# System
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False # PyTorch 2.0 compilation (use for speedup)
+    # Periodic save + sample
+    ap.add_argument("--save_every", type=int, default=100)
+    ap.add_argument("--sample_every", type=int, default=100)
+    ap.add_argument("--sample_tokens", type=int, default=120)
+    ap.add_argument("--top_k", type=int, default=200)
+    ap.add_argument("--temperature", type=float, default=0.8)
 
-# -----------------------------------------------------------------------------
-config = {}
-# exec(open('configurator.py').read()) # Overrides from command line
-# -----------------------------------------------------------------------------
+    # Optim & schedule
+    ap.add_argument("--lr", type=float, default=6e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.1)
+    ap.add_argument("--beta1", type=float, default=0.9)
+    ap.add_argument("--beta2", type=float, default=0.95)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--decay_lr", action="store_true", default=True)
+    ap.add_argument("--warmup_iters", type=int, default=2000)
+    ap.add_argument("--lr_decay_iters", type=int, default=600000)
+    ap.add_argument("--min_lr", type=float, default=6e-5)
 
-# Create output directory
-os.makedirs(out_dir, exist_ok=True)
+    # System
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--dtype", type=str, choices=["float32", "bfloat16", "float16"], default="bfloat16")
+    ap.add_argument("--compile", action="store_true", default=False)
+    return ap.parse_args()
 
-torch.manual_seed(1337)
 
-# --- Data Loading ------------------------------------------------------------
-def get_batch(split):
-    # Use memory-mapped files for efficient access
-    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint32, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i+1:i+block_size+1].astype(np.int64)) for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
+# --------------------------------------------------------------------------- #
+# Data loader
+# --------------------------------------------------------------------------- #
 
-# --- Model Configurations ----------------------------------------------------
-def count_parameters(model):
-    """Count total and trainable parameters in the model."""
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total_params, trainable_params
+class BinLoader:
+    def __init__(self, data_dir: str, split: str, block_size: int, batch_size: int, device: str):
+        path = os.path.join(data_dir, f"{split}.bin")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing {path}. Did you run prepare.py?")
+        self.data = np.memmap(path, dtype=np.uint32, mode="r")
+        self.block = block_size
+        self.bs = batch_size
+        self.device = device
 
-def get_config(size: str) -> ModelConfig:
-    """
-    Returns a ModelConfig instance for a specified model size.
-    """
-    if size == 'nano-gpt':
-        # This is a config for a 124M parameter model, very close to GPT-2 small.
-        # It's a non-MoE, non-GQA model for simple and fast testing.
-        return ModelConfig(
-            # Core dimensions - MUCH smaller
-            vocab_size=50257,             # Standard GPT-2 vocab size
-            hidden_size=768,
-            num_hidden_layers=12,
-            intermediate_size=3072,       # 4 * hidden_size
-            
-            # Attention
-            num_attention_heads=12,
-            num_key_value_heads=12,       # No GQA, so n_kv_head == n_head
-            head_dim=64,                  # hidden_size / num_attention_heads = 768 / 12 = 64
-            
-            # Context & Position - MUCH smaller  
-            max_position_embeddings=1024, # Small context length
-            sliding_window=128,
-            
-            # MoE - Disable MoE completely
-            num_local_experts=1,          # A "1-expert MoE" is just a standard dense FFN
-            experts_per_token=1,
-            
-            # For a non-SWA model, all layers are full attention
-            layer_types=['full_attention'] * 12,
-            
-            # Other reasonable defaults
-            enable_sink_token=False,
-            attention_bias=True,
-            tie_word_embeddings=False,
-        )
-    elif size == 'gpt-oss-5b':
-        # TINY test version for debugging - probably ~500M parameters
-        # Same architecture as 120B but MUCH smaller dimensions for testing
-        return ModelConfig(
-            # Core dimensions - VERY small for testing
-            vocab_size=200019,        # o200k_base actual vocab size
-            hidden_size=256,          # MUCH smaller (vs 2880 in full model)
-            num_hidden_layers=8,      # MUCH fewer layers (vs 36 in full model)
-            intermediate_size=256,    # VERY small per expert (vs 2880 in full model)
-            
-            # Attention - tiny but keep GQA ratio
-            num_attention_heads=8,    # MUCH smaller (vs 64 in full model)
-            num_key_value_heads=2,    # MUCH smaller (vs 8 in full model, keep 4:1 ratio)
-            head_dim=32,              # 256/8 = 32
-            
-            # MoE - very few experts for testing
-            num_local_experts=4,      # MUCH fewer (vs 128 in full model)
-            experts_per_token=2,      # vs 4 in full model
-            
-            # Context - smaller for testing
-            max_position_embeddings=1024,  # MUCH smaller (vs 131072 in full model)
-            sliding_window=64,        # vs 128 in full model
-            
-            # Keep same architecture features
-            attention_bias=True,
-            enable_sink_token=False,
-            layer_types=None,  # Will auto-generate alternating pattern
-            
-            # Other settings
-            rope_theta=150_000.0,
-            router_aux_loss_coef=0.9,
-            hidden_act="silu",
-            swiglu_limit=7.0,
-            rms_norm_eps=1e-5,
-            initializer_range=0.02,
-            tie_word_embeddings=False,
-            dropout=0.0,
-            attention_dropout=0.0,
-        )
-    elif size == 'gpt-oss-120b':
-        # The full model config from model.py
-        # WARNING: Do not attempt to train this without a large cluster.
-        return ModelConfig()
-    else:
-        raise ValueError(f"Unknown model size: {size}")
+    def get_batch(self):
+        # Random chunked batches
+        ix = np.random.randint(0, len(self.data) - self.block - 1, size=(self.bs,))
+        X = np.stack([self.data[i:i+self.block].astype(np.int64) for i in ix])
+        Y = np.stack([self.data[i+1:i+self.block+1].astype(np.int64) for i in ix])
+        X = torch.from_numpy(X).to(self.device)
+        Y = torch.from_numpy(Y).to(self.device)
+        return X, Y
 
-# --- Main Training Script ----------------------------------------------------
-if __name__ == "__main__":
-    # --- Initialization ---
-    
-    # Get model config
-    model_config = get_config(model_size)
-    print(f"--- Training model: {model_size} ---")
-    print("-" * 30)
 
-    # Gradient accumulation
-    gradient_accumulation_steps = 8
-    
-    # Initialize model
-    model = Transformer(model_config)
-    model.to(device)
-    
-    # Print model information
-    # print_model_info(model, model_size, max_iters)
+# --------------------------------------------------------------------------- #
+# Tokenizer helpers
+# --------------------------------------------------------------------------- #
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
+def load_tokenizer(meta_path: str):
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    tok_name = meta.get("tokenizer", "o200k_harmony")
+    try:
+        enc = tiktoken.get_encoding(tok_name)
+    except Exception:
+        enc = tiktoken.get_encoding("o200k_base")
+        tok_name = "o200k_base"
+        print(f"[train] WARNING: tokenizer '{meta.get('tokenizer')}' not available. Using 'o200k_base'.")
+    vocab_size = int(meta.get("vocab_size", getattr(enc, "n_vocab", 201_088)))
+    return enc, tok_name, vocab_size
 
-    # Check for a checkpoint to resume from
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+
+# --------------------------------------------------------------------------- #
+# Model configs
+# --------------------------------------------------------------------------- #
+
+def build_config(name: str) -> ModelConfig:
+    if name == "20b":
+        return gpt_oss_20b_config()
+    # Tiny “toy” config: same motifs (GQA, MoE, SWA) but small dims
+    return ModelConfig(
+        vocab_size=200_019,      # overwritten by meta.json later
+        hidden_size=256,
+        num_hidden_layers=8,
+        head_dim=32,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        max_position_embeddings=2048,
+        sliding_window=64,
+        num_local_experts=4,
+        experts_per_token=2,
+        intermediate_size=256,
+        rope_theta=150_000.0,
+        enable_sink_logit=False,
+        tie_word_embeddings=False,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Generation helper (no KV cache; keeps it simple)
+# --------------------------------------------------------------------------- #
+
+@torch.no_grad()
+def generate_tokens(model, input_ids, max_new_tokens=64, temperature=1.0, top_k=None,
+                    eos_token_id=None, device="cuda", block_size=512):
+    model.eval()
+    tokens = input_ids.to(device)
+    for _ in range(max_new_tokens):
+        # Truncate context to training block for speed/mem
+        inp = tokens[:, -block_size:]
+        logits, _ = model(inp, labels=None)
+        next_logits = logits[:, -1, :]
+
+        if temperature != 1.0:
+            next_logits = next_logits / max(1e-6, temperature)
+        if top_k is not None and top_k > 0:
+            v, _ = torch.topk(next_logits, top_k)
+            next_logits[next_logits < v[:, [-1]]] = -float("inf")
+
+        probs = F.softmax(next_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        tokens = torch.cat([tokens, next_token], dim=1)
+
+        if eos_token_id is not None and (next_token.squeeze(-1) == eos_token_id).all():
+            break
+    return tokens
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    args = get_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # tokenizer & vocab
+    meta_path = os.path.join(args.data_dir, "meta.json")
+    enc, tok_name, vocab_size = load_tokenizer(meta_path)
+
+    # model config
+    cfg = build_config(args.model_size)
+    cfg.vocab_size = vocab_size
+    if args.block_size > cfg.max_position_embeddings:
+        print(f"[train] Reducing block_size from {args.block_size} to model max {cfg.max_position_embeddings}")
+        args.block_size = cfg.max_position_embeddings
+
+    # model
+    model = Transformer(cfg).to(device)
+    if args.compile and device == "cuda":
+        print("[train] torch.compile() on…")
+        model = torch.compile(model)
+
+    # params summary
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("=" * 60)
+    print(f"Model: {args.model_size}   device: {device}")
+    print(f"Tokenizer: {tok_name}  vocab: {vocab_size}")
+    print(f"Params: total {total/1e6:.1f}M  trainable {trainable/1e6:.1f}M")
+    print(f"Context: train block {args.block_size} (model max {cfg.max_position_embeddings})")
+    print("=" * 60)
+
+    # data
+    train_loader = BinLoader(args.data_dir, "train", args.block_size, args.batch_size, device)
+    val_loader   = BinLoader(args.data_dir, "val",   args.block_size, args.batch_size, device)
+
+    # AMP
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    amp_dtype = dtype_map[args.dtype]
+    ctx = nullcontext() if device == "cpu" else torch.amp.autocast("cuda", dtype=amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and args.dtype == "float16"))
+
+    # optim
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                            betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+
+    # resume
+    ckpt_path = os.path.join(args.out_dir, "ckpt.pt")
     iter_num = 0
-    best_val_loss = 1e9
+    best_val = float("inf")
     if os.path.exists(ckpt_path):
-        print("Resuming training from checkpoint.")
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
+        print(f"[train] Resuming from {ckpt_path}")
+        payload = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(payload["model_state_dict"])
+        opt.load_state_dict(payload["optimizer_state_dict"])
+        iter_num = int(payload.get("iter_num", 0))
+        best_val = float(payload.get("best_val_loss", best_val))
+        # Update cfg if you want to hard-override from checkpoint:
+        # cfg = payload.get("model_config", cfg)
 
-    # Learning rate scheduler
-    def get_lr(it):
-        if not decay_lr:
-            return learning_rate
-        # 1) linear warmup for warmup_iters steps
-        if it < warmup_iters:
-            return learning_rate * it / warmup_iters
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > lr_decay_iters:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-        assert 0 <= decay_ratio <= 1
+    # lr schedule
+    def get_lr(it: int) -> float:
+        if not args.decay_lr:
+            return args.lr
+        if it < args.warmup_iters:
+            return args.lr * it / max(1, args.warmup_iters)
+        if it > args.lr_decay_iters:
+            return args.min_lr
+        decay_ratio = (it - args.warmup_iters) / (args.lr_decay_iters - args.warmup_iters)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return min_lr + coeff * (learning_rate - min_lr)
-        
-    # Mixed precision training
-    pt_dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-    ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=pt_dtype)
-    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
+        return args.min_lr + coeff * (args.lr - args.min_lr)
 
-    # For decoding generated text
-    enc = tiktoken.get_encoding("o200k_base")
-    
-    # --- Training Loop ---
-    X, Y = get_batch('train') # Fetch first batch
-    t0 = time.time()
-    
-    while iter_num < max_iters:
-        # Update learning rate
-        lr = get_lr(iter_num)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        # --- Evaluation (Periodic) ---
-        if iter_num % eval_interval == 0 and iter_num > 0:  # Don't run validation at iter 0
-            model.eval()
-            print("\n--- Running Validation ---")
-            
-            # Estimate validation loss
-            with torch.no_grad():
-                losses = torch.zeros(eval_iters)
-                for k in range(eval_iters):
-                    X_val, Y_val = get_batch('val')
-                    with ctx:
-                        logits, outputs = model(X_val, labels=Y_val)
-                    losses[k] = outputs['loss'].item()
-                val_loss = losses.mean()
-            
-            print(f"iter {iter_num}: val loss {val_loss:.4f}")
-
-            # --- Generate Sample Text ---
-            print("--- Generating Sample Text ---")
-            with torch.no_grad():
+    # small eval helper
+    def evaluate() -> float:
+        model.eval()
+        losses = []
+        with torch.no_grad():
+            for _ in range(args.eval_iters):
+                Xv, Yv = val_loader.get_batch()
                 with ctx:
-                    start_ids = torch.zeros((1, 1), dtype=torch.long, device=device) # Start with token 0 (e.g., <|endoftext|>)
-                    generated_tokens = model.generate(start_ids, max_new_tokens=100, temperature=0.8, top_k=200)
-                    decoded_text = enc.decode(generated_tokens[0].tolist())
-                    print(decoded_text)
-            print("-" * 30 + "\n")
+                    _, out = model(Xv, labels=Yv)
+                losses.append(out["loss"].item())
+        model.train()
+        return sum(losses) / len(losses)
 
-            # Save checkpoint if it's the best so far
-            if val_loss < best_val_loss or always_save_checkpoint:
-                best_val_loss = val_loss
-                if iter_num > 0:
-                    print(f"Saving checkpoint to {out_dir}")
-                    checkpoint = {
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'model_config': model_config,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                    }
-                    torch.save(checkpoint, ckpt_path)
-            model.train()
+    # sampling helper (uses the generation loop above)
+    def sample(n_tokens: int):
+        model.eval()
+        with torch.no_grad():
+            start_tok = enc.encode("\n")[0]
+            start_ids = torch.tensor([[start_tok]], device=device, dtype=torch.long)
+            out_ids = generate_tokens(model, start_ids,
+                                      max_new_tokens=n_tokens,
+                                      temperature=args.temperature,
+                                      top_k=args.top_k,
+                                      eos_token_id=getattr(model.config, "eos_token_id", None),
+                                      device=device,
+                                      block_size=args.block_size)
+            print("\n--- SAMPLE ---")
+            print(enc.decode(out_ids[0].tolist()))
+            print("--------------\n")
+        model.train()
 
-        # --- Training Step ---
-        for micro_step in range(gradient_accumulation_steps):
-            with ctx:
-                logits, outputs = model(X, labels=Y)
-                loss = outputs['loss'] / gradient_accumulation_steps
-            
-            # Fetch next batch right away to overlap compute and data transfer
-            X, Y = get_batch('train')
+    # training loop
+    t0 = time.time()
+    X, Y = train_loader.get_batch()
+    while iter_num < args.max_iters:
+        # set lr
+        lr = get_lr(iter_num)
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+        # fw/bw
+        with ctx:
+            _, out = model(X, labels=Y)
+            loss = out["loss"]
+
+        if scaler.is_enabled():
             scaler.scale(loss).backward()
-            
-        # Clip gradients
-        if grad_clip > 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        
-        # Optimizer step
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+            if args.grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+        opt.zero_grad(set_to_none=True)
 
-        # Log training progress
-        if iter_num % log_interval == 0:
+        # prefetch next batch
+        X, Y = train_loader.get_batch()
+
+        # logs
+        if iter_num % args.log_interval == 0:
             dt = time.time() - t0
             t0 = time.time()
-            lossf = loss.item() * gradient_accumulation_steps # last micro-step's loss
-            print(f"iter {iter_num}: train loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.6f}")
+            print(f"iter {iter_num:06d}  loss {loss.item():.4f}  lr {lr:.6e}  {dt*1000:.1f} ms/it")
+
+        # periodic eval (+ save on best)
+        if args.eval_interval > 0 and iter_num > 0 and iter_num % args.eval_interval == 0:
+            val = evaluate()
+            print(f"[eval] iter {iter_num}  val_loss {val:.4f}")
+            if val < best_val:
+                best_val = val
+                print(f"[ckpt] new best ({best_val:.4f}) → saving {ckpt_path}")
+                payload = {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "model_config": cfg,
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val,
+                    "tokenizer": tok_name,
+                }
+                torch.save(payload, ckpt_path)
+
+        # periodic sample
+        if args.sample_every > 0 and iter_num % args.sample_every == 0:
+            sample(args.sample_tokens)
+
+        # periodic save
+        if args.save_every > 0 and iter_num > 0 and iter_num % args.save_every == 0:
+            print(f"[ckpt] saving (periodic) at iter {iter_num} → {ckpt_path}")
+            payload = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "model_config": cfg,
+                "iter_num": iter_num,
+                "best_val_loss": best_val,
+                "tokenizer": tok_name,
+            }
+            torch.save(payload, ckpt_path)
 
         iter_num += 1
 
-    print("--- Training Finished ---")
+    print("[train] done.")
+
+
+if __name__ == "__main__":
+    main()
