@@ -1,10 +1,5 @@
-# model.py — GPT-OSS-20B (open-weight) research-faithful replica
-# Matches OpenAI’s published architecture: 24L, MoE(32, top-4, SwiGLU),
-# GQA (64q / 8kv, d_head=64), alt. dense vs 128-window attention,
-# RoPE + simple YaRN-style scaling, learned sink logit, o200k_harmony vocab.
-#
-# Param table in OpenAI’s model card: 20.91B total, 3.61B active, V=201,088. See:
-# https://openai.com/index/gpt-oss-model-card/  (PDF: table shows 20.91B & details)
+# model.py — GPT-OSS-20B-style Transformer with MoE, GQA, RoPE(+stretch), sink-bias,
+# optional FlashAttention, and FSDP-friendly reset_parameters() on all modules.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -15,9 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---- Optional Flash-Attention-2 -----------------------------------------------------
+# ---- Optional Flash-Attention-2 / 3 -----------------------------------------
+_flash_available = False
 try:
-    # flash_attn >= 2.x
+    # flash_attn >= 2.x API
     from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
     _flash_available = True
 except Exception:
@@ -65,10 +61,10 @@ class ModelConfig:
     swiglu_clip: float = 7.0
 
     # RoPE / YaRN
-    rope_theta: float = 150_000.0  # long-context friendly default
+    rope_theta: float = 150_000.0
     rope_scaling: RopeScalingConfig = field(default_factory=RopeScalingConfig)
 
-    # Sink (null attention column)
+    # Sink (null-attention bias)
     enable_sink_logit: bool = True
     sink_logit_init: float = 4.0  # positive → allows "attend to nothing"
 
@@ -86,13 +82,8 @@ class ModelConfig:
                 for i in range(self.num_hidden_layers)
             ]
         assert len(self.layer_types) == self.num_hidden_layers
-        # GQA: require group divisibility (n_q heads must be divisible by n_kv heads)
         assert self.num_attention_heads % self.num_key_value_heads == 0
-        # head_dim must be positive
         assert self.head_dim > 0
-        # Note: for GQA the projection shapes are decoupled, so we do not require
-        # hidden_size == num_attention_heads * head_dim (that's only true for standard MHA).
-
 
     @property
     def group_size(self) -> int:
@@ -108,10 +99,16 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         return self.weight * x
+
+    # FSDP meta materialization support
+    def reset_parameters(self):
+        with torch.no_grad():
+            self.weight.fill_(1.0)
 
 
 def swiglu(x: torch.Tensor, clip: Optional[float] = None) -> torch.Tensor:
@@ -125,23 +122,41 @@ def swiglu(x: torch.Tensor, clip: Optional[float] = None) -> torch.Tensor:
 class RotaryEmbedding(nn.Module):
     """
     Standard RoPE with a simple YaRN-style stretch: positions/factor.
+    Buffers must be (re)materialized on nonzero ranks during FSDP meta build.
     """
     def __init__(self, head_dim: int, rope_theta: float, scale_cfg: RopeScalingConfig):
         super().__init__()
-        self.head_dim = head_dim
-        self.theta = rope_theta
+        self.head_dim = int(head_dim)
+        self.theta = float(rope_theta)
         self.factor = float(scale_cfg.factor)
-        inv_freq = 1.0 / (self.theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("inv_freq_base", inv_freq, persistent=False)
+
+        # Placeholders; real buffers (CPU) in reset_parameters()
+        self.register_buffer("inv_freq_base", torch.empty(0), persistent=False)
         self._seq_len_cached = 0
         self.register_buffer("cos_cached", torch.empty(0), persistent=False)
         self.register_buffer("sin_cached", torch.empty(0), persistent=False)
 
+        # Immediately build once so rank0 (non-meta) has valid buffers
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Build base frequencies on CPU; FSDP will move as needed.
+        device = torch.device("cpu")
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=device) / self.head_dim)
+        )
+        self.register_buffer("inv_freq_base", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self.register_buffer("cos_cached", torch.empty(0, dtype=torch.float32, device=device), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0, dtype=torch.float32, device=device), persistent=False)
+
     def _update_cache(self, seqlen: int, device, dtype):
-        if seqlen <= self._seq_len_cached and self.cos_cached.device == device and self.cos_cached.dtype == dtype:
+        if (seqlen <= self._seq_len_cached and
+            self.cos_cached.device == device and
+            self.cos_cached.dtype == dtype):
             return
         pos = torch.arange(seqlen, device=device, dtype=torch.float32) / self.factor
-        freqs = torch.einsum("s,f->sf", pos, self.inv_freq_base)
+        freqs = torch.einsum("s,f->sf", pos, self.inv_freq_base.to(device=device))
         cos = torch.cos(freqs).to(dtype)
         sin = torch.sin(freqs).to(dtype)
         # interleave
@@ -169,10 +184,10 @@ class MultiheadSelfAttention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         H = cfg.hidden_size
-        self.n_head = cfg.num_attention_heads
-        self.n_kv = cfg.num_key_value_heads
-        self.dh = cfg.head_dim
-        self.group_size = cfg.group_size
+        self.n_head = int(cfg.num_attention_heads)
+        self.n_kv = int(cfg.num_key_value_heads)
+        self.dh = int(cfg.head_dim)
+        self.group_size = int(cfg.group_size)
         self.scale = 1.0 / math.sqrt(self.dh)
         self.drop_attn = nn.Dropout(cfg.attention_dropout)
         self.drop_resid = nn.Dropout(cfg.dropout)
@@ -187,11 +202,30 @@ class MultiheadSelfAttention(nn.Module):
         self.use_sink = bool(cfg.enable_sink_logit)
         if self.use_sink:
             self.sink_logit = nn.Parameter(torch.full((self.n_head,), float(cfg.sink_logit_init)))
+        else:
+            # create a dummy buffer so reset_parameters() can always reference it safely
+            self.register_buffer("sink_logit", torch.empty(0), persistent=False)
 
-        for m in (self.q, self.k, self.v, self.o):
-            nn.init.normal_(m.weight, mean=0.0, std=cfg.initializer_range)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        # store init settings for reset_parameters()
+        self.init_std = float(cfg.initializer_range)
+        self.sink_init = float(cfg.sink_logit_init)
+
+        # init once for rank0
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Robust to attributes missing during meta materialization
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            for m in (self.q, self.k, self.v, self.o):
+                nn.init.normal_(m.weight, mean=0.0, std=init_std)
+                if getattr(m, "bias", None) is not None:
+                    m.bias.zero_()
+            if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
+                self.sink_logit.fill_(getattr(self, "sink_init", 4.0))
+        # also reset RoPE buffers so nonzero ranks get real tensors
+        if hasattr(self, "rope") and hasattr(self.rope, "reset_parameters"):
+            self.rope.reset_parameters()
 
     def _kv_expand(self, kv: torch.Tensor) -> torch.Tensor:
         # (B, T, n_kv*Dh) -> (B, H, T, Dh)
@@ -228,15 +262,13 @@ class MultiheadSelfAttention(nn.Module):
         q = self.rope.apply(q.view(B * self.n_head, T, self.dh), pos_rep).view(B, self.n_head, T, self.dh)
         k = self.rope.apply(k.view(B * self.n_head, T, self.dh), pos_rep).view(B, self.n_head, T, self.dh)
 
-        # Decide mask + kernel
-        use_flash = _flash_available and (not is_sliding_layer) and (not self.use_sink)
-        # If we can use flash: only causal, no extra biases/masks beyond causal
+        # Fast path: use FlashAttention only for pure causal full-attn w/o sink column
+        use_flash = _flash_available and (not is_sliding_layer) and (not getattr(self, "use_sink", False))
         if use_flash:
             # Flash-Attn expects (B,T,H,D)
             qf = q.transpose(1, 2)  # (B,T,H,D)
             kf = k.transpose(1, 2)
             vf = v.transpose(1, 2)
-            # SDPA-style masks can't be passed here; relies on causal=True only
             out = _flash_attn_func(qf, kf, vf, causal=True)  # (B,T,H,D)
             out = out.transpose(1, 2).contiguous().view(B, T, self.n_head * self.dh)
             out = self.o(out)
@@ -255,13 +287,13 @@ class MultiheadSelfAttention(nn.Module):
         # Apply mask
         att = att.masked_fill(~mask.view(1, 1, T, T), float("-inf"))
 
-        # Append sink column (null attention)
-        if self.use_sink:
+        # Append sink column (null attention) if enabled
+        if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
             sink_col = self.sink_logit.view(1, self.n_head, 1, 1).expand(B, -1, T, 1)
             att = torch.cat([att, sink_col], dim=-1)  # (B,H,T,T+1)
 
         p = F.softmax(att, dim=-1)
-        if self.use_sink:
+        if getattr(self, "use_sink", False) and hasattr(self, "sink_logit") and self.sink_logit.numel() > 0:
             p = p[..., :-1]  # drop sink prob (mass = "attend to nothing")
         p = self.drop_attn(p)
 
@@ -273,15 +305,15 @@ class MultiheadSelfAttention(nn.Module):
 
 class MoE(nn.Module):
     """
-    Per-layer MoE with E experts; top-K gating (on logits), SwiGLU experts.
-    Paramization: shared bank of expert weights, token-wise routing.
+    Per-layer MoE with E experts; top-K routing (on logits), SwiGLU experts.
+    Parameterization: shared expert banks, token-wise routing/weighting.
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         H = cfg.hidden_size
         E = cfg.num_local_experts
         FF = cfg.intermediate_size
-        self.E = E
+        self.E = int(E)
         self.K = int(cfg.experts_per_token)
         self.clip = float(cfg.swiglu_clip)
         self.router_aux_loss_coef = float(cfg.router_aux_loss_coef)
@@ -295,13 +327,21 @@ class MoE(nn.Module):
         # Router
         self.router = nn.Linear(H, E, bias=True)
 
-        # Init
-        for p in (self.W_in, self.W_out):
-            nn.init.normal_(p, mean=0.0, std=cfg.initializer_range)
-        nn.init.zeros_(self.b_in)
-        nn.init.zeros_(self.b_out)
-        nn.init.normal_(self.router.weight, mean=0.0, std=cfg.initializer_range)
-        nn.init.zeros_(self.router.bias)
+        # store init std for reset
+        self.init_std = float(cfg.initializer_range)
+
+        # init once for rank0
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            nn.init.normal_(self.W_in,  mean=0.0, std=init_std)
+            nn.init.normal_(self.W_out, mean=0.0, std=init_std)
+            self.b_in.zero_(); self.b_out.zero_()
+            nn.init.normal_(self.router.weight, mean=0.0, std=init_std)
+            if self.router.bias is not None:
+                self.router.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # x: (B,T,H)
@@ -320,7 +360,7 @@ class MoE(nn.Module):
         idx = topk.indices                            # (B,T,K)
         wts = F.softmax(topk.values, dim=-1)          # (B,T,K)
 
-        # Compute experts in a semi-bucketed way (readable & correct)
+        # Compute experts in a simple but correct token-bucketed way
         out = torch.zeros_like(x)
         for k in range(self.K):
             ek = idx[..., k]                          # (B,T) expert id chosen for this slot
@@ -349,6 +389,13 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.moe = MoE(cfg)
 
+    def reset_parameters(self):
+        # Submodules handle their own init; keep for FSDP completeness
+        if hasattr(self.norm1, "reset_parameters"): self.norm1.reset_parameters()
+        if hasattr(self.attn,  "reset_parameters"): self.attn.reset_parameters()
+        if hasattr(self.norm2, "reset_parameters"): self.norm2.reset_parameters()
+        if hasattr(self.moe,   "reset_parameters"): self.moe.reset_parameters()
+
     def forward(
         self,
         x: torch.Tensor,
@@ -375,18 +422,34 @@ class Transformer(nn.Module):
         self.norm_f = RMSNorm(H, eps=cfg.rms_norm_eps)
         self.lm_head = nn.Linear(H, cfg.vocab_size, bias=False)
 
-        # Init
-        nn.init.normal_(self.embed.weight, mean=0.0, std=cfg.initializer_range)
+        # store init std for reset
+        self.init_std = float(cfg.initializer_range)
+
+        # optional tying
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.embed.weight
-        else:
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=cfg.initializer_range)
+
+        # init once for rank0
+        self.reset_parameters()
 
     @staticmethod
     def build_causal_mask(T: int, device, dtype=torch.bool) -> torch.Tensor:
         i = torch.arange(T, device=device)
         j = torch.arange(T, device=device)
         return (j[None, :] <= i[:, None]).to(dtype)
+
+    def reset_parameters(self):
+        init_std = getattr(self, "init_std", 0.02)
+        with torch.no_grad():
+            nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+            if self.lm_head.weight is not self.embed.weight:
+                nn.init.normal_(self.lm_head.weight, mean=0.0, std=init_std)
+        # Cascade to blocks + final norm
+        for blk in getattr(self, "layers", []):
+            if hasattr(blk, "reset_parameters"):
+                blk.reset_parameters()
+        if hasattr(self.norm_f, "reset_parameters"):
+            self.norm_f.reset_parameters()
 
     def forward(
         self,
@@ -448,7 +511,7 @@ def gpt_oss_20b_config() -> ModelConfig:
         intermediate_size=2880,
         swiglu_clip=7.0,
         rope_theta=150_000.0,
-        enable_sink_logit=True,
+        enable_sink_logit=True,   # sink-bias enabled (flash kept on full-attn layers)
         sink_logit_init=4.0,
         rms_norm_eps=1e-5,
         initializer_range=0.02,
@@ -464,4 +527,3 @@ if __name__ == "__main__":
     print(f"Total parameters: {n_params/1e9:.3f} B")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable:        {trainable/1e9:.3f} B")
-    # Expect ~20.91B total as per OpenAI's model card table.
