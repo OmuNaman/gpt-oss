@@ -305,8 +305,7 @@ class MultiheadSelfAttention(nn.Module):
 
 class MoE(nn.Module):
     """
-    Per-layer MoE with E experts; top-K routing (on logits), SwiGLU experts.
-    Parameterization: shared expert banks, token-wise routing/weighting.
+    A fast, vectorized MoE layer using einsum.
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -344,39 +343,55 @@ class MoE(nn.Module):
                 self.router.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # x: (B,T,H)
+        # x: (B,T,H) -> (S,H) where S=B*T
         B, T, H = x.shape
-        logits = self.router(x)                      # (B,T,E)
+        S = B * T
+        x_flat = x.view(S, H)
 
-        # Aux (Switch-style): encourage balanced usage
-        probs = F.softmax(logits, dim=-1)
-        importance = probs.mean(dim=(0, 1))          # (E,)
-        top1 = probs.argmax(dim=-1)                  # (B,T)
-        load = F.one_hot(top1, num_classes=self.E).float().mean(dim=(0, 1))
-        aux_loss = self.E * (importance * load).sum()
+        # Route tokens to experts
+        logits = self.router(x_flat)  # (S, E)
 
-        # Top-K on logits, then softmax within K
-        topk = torch.topk(logits, k=self.K, dim=-1, sorted=True)
-        idx = topk.indices                            # (B,T,K)
-        wts = F.softmax(topk.values, dim=-1)          # (B,T,K)
+        # Top-K routing
+        topk_weights, topk_indices = torch.topk(logits, self.K, dim=-1)  # (S, K), (S, K)
+        topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
 
-        # Compute experts in a simple but correct token-bucketed way
-        out = torch.zeros_like(x)
-        for k in range(self.K):
-            ek = idx[..., k]                          # (B,T) expert id chosen for this slot
-            wk = wts[..., k:k+1]                      # (B,T,1)
-            # For each expert e, process its selected tokens
-            for e in range(self.E):
-                sel = (ek == e)                       # (B,T)
-                if not sel.any():
-                    continue
-                xe = x[sel]                           # (N_e, H)
-                u = xe @ self.W_in[e] + self.b_in[e]  # (N_e, 2*FF)
-                u = swiglu(u, clip=self.clip)         # (N_e, FF)
-                ye = u @ self.W_out[e] + self.b_out[e]# (N_e, H)
-                we = wk[sel].view(-1, 1)              # (N_e, 1)
-                ye = ye * we
-                out[sel] += ye
+        # Aux (Switch-style) loss for load balancing
+        probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+        importance = probs.mean(dim=0)          # (E,)
+        load = F.one_hot(topk_indices.argmax(dim=-1), num_classes=self.E).float().mean(dim=0)
+        aux_loss = self.router_aux_loss_coef * self.E * (importance * load).sum()
+
+        # Create a one-hot mask for selected experts for each token and top-k choice
+        # (S, K) -> (S, K, E)
+        expert_mask = F.one_hot(topk_indices, num_classes=self.E)
+
+        # Combine the mask with the weights
+        # (S, K, E) * (S, K, 1) -> (S, K, E)
+        gating_weights = expert_mask * topk_weights.unsqueeze(-1)
+
+        # Sum weights over K choices to get the final weight for each expert for each token
+        # (S, K, E) -> (S, E)
+        final_expert_weights = gating_weights.sum(dim=1)
+
+        # --- Vectorized Expert Computation ---
+        # 1. Apply all experts' W_in to all tokens
+        #    'sh,ehd->sed': (S,H) @ (E,H,2FF) -> (S,E,2FF)
+        expert_inputs = torch.einsum('sh,ehd->sed', x_flat, self.W_in) + self.b_in
+        
+        # 2. Apply SwiGLU activation
+        #    swiglu halves the last dimension
+        expert_outputs = swiglu(expert_inputs, clip=self.clip) # (S,E,FF)
+
+        # 3. Apply all experts' W_out
+        #    'sef,efh->seh': (S,E,FF) @ (E,FF,H) -> (S,E,H)
+        expert_outputs = torch.einsum('sef,efh->seh', expert_outputs, self.W_out) + self.b_out
+
+        # 4. Weight the expert outputs by the router weights and sum
+        #    'seh,se->sh': (S,E,H) * (S,E) -> (S,H)
+        weighted_output = torch.einsum('seh,se->sh', expert_outputs, final_expert_weights)
+
+        # Reshape back to (B, T, H)
+        out = weighted_output.view(B, T, H)
 
         return out, {"router_aux_loss": aux_loss}
 
@@ -511,7 +526,7 @@ def gpt_oss_20b_config() -> ModelConfig:
         intermediate_size=2880,
         swiglu_clip=7.0,
         rope_theta=150_000.0,
-        enable_sink_logit=True,   # sink-bias enabled (flash kept on full-attn layers)
+        enable_sink_logit=False,   # sink-bias enabled (flash kept on full-attn layers)
         sink_logit_init=4.0,
         rms_norm_eps=1e-5,
         initializer_range=0.02,
