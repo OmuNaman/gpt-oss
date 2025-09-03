@@ -2,6 +2,7 @@
 import argparse, dataclasses, json, math, os, time
 from contextlib import nullcontext
 from functools import partial
+import datetime
 
 import numpy as np
 import torch
@@ -160,7 +161,8 @@ def main():
 
     # dist
     if is_dist():
-        dist.init_process_group(backend="nccl")
+        timeout = datetime.timedelta(minutes=60)
+        dist.init_process_group(backend="nccl", timeout=timeout)
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
