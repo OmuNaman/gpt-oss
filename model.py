@@ -526,7 +526,7 @@ def gpt_oss_20b_config() -> ModelConfig:
         intermediate_size=2880,
         swiglu_clip=7.0,
         rope_theta=150_000.0,
-        enable_sink_logit=False,   # sink-bias enabled (flash kept on full-attn layers)
+        enable_sink_logit=True,   # sink-bias enabled (flash kept on full-attn layers)
         sink_logit_init=4.0,
         rms_norm_eps=1e-5,
         initializer_range=0.02,

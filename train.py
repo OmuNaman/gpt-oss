@@ -109,23 +109,48 @@ def build_config(name: str) -> ModelConfig:
 @torch.no_grad()
 def sample_text(model, enc, device, n_tokens=120, temperature=0.8, top_k=200,
                 block_size=512, amp_dtype=torch.bfloat16):
+    # Use FSDP's recommended context manager for inference
+    # This gathers all the parameters on rank 0 without OOMing on other ranks
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+    
+    # We must be on rank 0 to sample
+    if is_dist() and dist.get_rank() != 0:
+        return ""
+
     was_training = model.training
     model.eval()
+
     start_tok = enc.encode("\n")[0]
     tokens = torch.tensor([[start_tok]], device=device, dtype=torch.long)
+    
+    # Use bfloat16 for inference
     ctx = nullcontext() if "cpu" in str(device) else torch.amp.autocast("cuda", dtype=amp_dtype)
-    with ctx:
-        for _ in range(n_tokens):
-            inp = tokens[:, -block_size:]
-            logits, _ = model(inp, labels=None)
-            nxt_logits = logits[:, -1, :]
-            if temperature != 1.0: nxt_logits = nxt_logits / max(1e-6, temperature)
-            if top_k and top_k > 0:
-                v, _ = torch.topk(nxt_logits, top_k); nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
-            probs = torch.softmax(nxt_logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
-            tokens = torch.cat([tokens, nxt], dim=1)
-    if was_training: model.train()
+
+    # FSDP's summon_full_params is the safe way to get the full model for inference
+    # It offloads to CPU to avoid VRAM spikes and only does this on rank 0.
+    with FSDP.summon_full_params(model, state_dict_type=StateDictType.FULL_STATE_DICT, offload_to_cpu=True, rank0_only=True):
+        with ctx:
+            for _ in range(n_tokens):
+                inp = tokens[:, -block_size:]
+                # The model is now on CPU because of offload_to_cpu=True, so move input to CPU
+                logits, _ = model(inp.to('cpu'), labels=None)
+                
+                # Move logits to the target device for sampling
+                nxt_logits = logits[:, -1, :].to(device)
+
+                if temperature != 1.0: nxt_logits = nxt_logits / max(1e-6, temperature)
+                if top_k and top_k > 0:
+                    v, _ = torch.topk(nxt_logits, top_k)
+                    nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
+                
+                probs = torch.softmax(nxt_logits, dim=-1)
+                nxt = torch.multinomial(probs, num_samples=1)
+                tokens = torch.cat([tokens, nxt], dim=1)
+
+    if was_training:
+        model.train()
+    
     return enc.decode(tokens[0].tolist())
 
 # -------------------------------- main ---------------------------------------
