@@ -162,7 +162,7 @@ This project is licensed under the **Apache 2.0 License**. See the [LICENSE](LIC
 If you use this codebase in your research or work, please consider citing our repository:
 
 ```bibtex
-@software{Vizuara_GPT-OSS_Replication_2024,
+@software{Vizuara_GPT-OSS_Replication_2025,
   author = {Naman and Dr. Raj Dandekar,
   title = {{An Open-Source Implementation of gpt-oss-20b}},
   month = {September},
