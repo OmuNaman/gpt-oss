@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import argparse, dataclasses, json, math, os, time
+import argparse, dataclasses, json, math, os, time, datetime, glob
 from contextlib import nullcontext
 from functools import partial
-import datetime
 
 import numpy as np
 import torch
@@ -15,8 +14,16 @@ except ImportError as e:
     raise SystemExit("Please `pip install tiktoken` first.") from e
 
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, FullStateDictConfig, FullOptimStateDictConfig
-from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
+from torch.distributed.fsdp import (
+    StateDictType,
+    FullStateDictConfig,
+    ShardedStateDictConfig,
+    FullOptimStateDictConfig,
+)
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    MixedPrecision,
+    ShardedOptimStateDictConfig,
+)
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, size_based_auto_wrap_policy
 
 from model import Transformer, ModelConfig, gpt_oss_20b_config, TransformerBlock
@@ -58,6 +65,8 @@ def get_args():
     # wrap policy
     ap.add_argument("--wrap_policy", type=str, choices=["transformer", "size"], default="transformer")
     ap.add_argument("--min_params", type=int, default=2_000_000)
+    # checkpoint style (default: sharded)
+    ap.add_argument("--ckpt_prefix", type=str, default="ckpt")  # produces <out_dir>/ckpt_rank00000.pt etc.
     return ap.parse_args()
 
 # ------------------------------ helpers --------------------------------------
@@ -108,58 +117,51 @@ def build_config(name: str) -> ModelConfig:
     )
 
 @torch.no_grad()
-def sample_text(model, enc, device, n_tokens=120, temperature=0.8, top_k=200,
-                block_size=512, amp_dtype=torch.bfloat16):
-    # Use FSDP's recommended context manager for inference
-    # This gathers all the parameters on rank 0 without OOMing on other ranks
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
-    
-    # We must be on rank 0 to sample
-    if is_dist() and dist.get_rank() != 0:
-        return ""
+def sample_text_collective(model, enc, device, n_tokens=120, temperature=0.8, top_k=200,
+                           block_size=512, amp_dtype=torch.bfloat16) -> str:
+    """
+    All ranks enter (so FSDP collectives don't deadlock).
+    Only rank 0 returns the decoded text; others return "".
+    """
+    rank = dist.get_rank() if is_dist() else 0
 
-    was_training = model.training
+    model_was_training = model.training
     model.eval()
 
     start_tok = enc.encode("\n")[0]
     tokens = torch.tensor([[start_tok]], device=device, dtype=torch.long)
-    
-    # Use bfloat16 for inference
-    ctx = nullcontext() if "cpu" in str(device) else torch.amp.autocast("cuda", dtype=amp_dtype)
 
-    # FSDP's summon_full_params is the safe way to get the full model for inference
-    # It offloads to CPU to avoid VRAM spikes and only does this on rank 0.
-    with FSDP.summon_full_params(model, state_dict_type=StateDictType.FULL_STATE_DICT, offload_to_cpu=True, rank0_only=True):
-        with ctx:
-            for _ in range(n_tokens):
-                inp = tokens[:, -block_size:]
-                # The model is now on CPU because of offload_to_cpu=True, so move input to CPU
-                logits, _ = model(inp.to('cpu'), labels=None)
-                
-                # Move logits to the target device for sampling
-                nxt_logits = logits[:, -1, :].to(device)
+    ctx = nullcontext() if "cpu" in str(device) else torch.autocast("cuda", dtype=amp_dtype)
+    with torch.inference_mode():
+        for _ in range(n_tokens):
+            inp = tokens[:, -block_size:]
+            with ctx:
+                logits, _ = model(inp, labels=None)  # regular FSDP forward; all ranks participate
+                nxt_logits = logits[:, -1, :]
 
-                if temperature != 1.0: nxt_logits = nxt_logits / max(1e-6, temperature)
-                if top_k and top_k > 0:
-                    v, _ = torch.topk(nxt_logits, top_k)
-                    nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
-                
-                probs = torch.softmax(nxt_logits, dim=-1)
-                nxt = torch.multinomial(probs, num_samples=1)
-                tokens = torch.cat([tokens, nxt], dim=1)
+            # temp + top-k
+            if temperature != 1.0:
+                nxt_logits = nxt_logits / max(1e-6, temperature)
+            if top_k and top_k > 0:
+                v, _ = torch.topk(nxt_logits, top_k)
+                nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
 
-    if was_training:
+            probs = torch.softmax(nxt_logits, dim=-1)
+            nxt = torch.multinomial(probs, num_samples=1)
+            tokens = torch.cat([tokens, nxt], dim=1)
+
+    if model_was_training:
         model.train()
-    
-    return enc.decode(tokens[0].tolist())
+
+    txt = enc.decode(tokens[0].tolist()) if rank == 0 else ""
+    return txt
 
 # -------------------------------- main ---------------------------------------
 def main():
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     args = get_args()
 
-    # dist
+    # dist init
     if is_dist():
         timeout = datetime.timedelta(minutes=60)
         dist.init_process_group(backend="nccl", timeout=timeout)
@@ -172,8 +174,8 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         rank = 0; world_size = 1
 
-    if args.model_size == "20b" and world_size < 8:
-        rank0_print("WARNING: 20B ideally needs many GPUs (e.g., 8×A100-80GB).")
+    if args.model_size == "20b" and world_size < 5:
+        rank0_print("WARNING: 20B ideally needs many GPUs; you're running fewer than 5 ranks.")
 
     os.makedirs(args.out_dir, exist_ok=True)
     torch.manual_seed(args.seed + rank); np.random.seed(args.seed + rank)
@@ -213,32 +215,27 @@ def main():
         std = getattr(getattr(m, "config", None), "initializer_range", 0.02)
 
         for mod in m.modules():
-            # nn.Linear
             if isinstance(mod, torch.nn.Linear):
-                if mod.weight is not None and mod.weight.is_meta is False:
+                if mod.weight is not None and not mod.weight.is_meta:
                     torch.nn.init.normal_(mod.weight, mean=0.0, std=std)
-                if mod.bias is not None and mod.bias.is_meta is False:
+                if mod.bias is not None and not mod.bias.is_meta:
                     torch.nn.init.zeros_(mod.bias)
-            # nn.Embedding
             elif isinstance(mod, torch.nn.Embedding):
-                if mod.weight is not None and mod.weight.is_meta is False:
+                if mod.weight is not None and not mod.weight.is_meta:
                     torch.nn.init.normal_(mod.weight, mean=0.0, std=std)
-            # RMSNorm (custom)
             elif mod.__class__.__name__ == "RMSNorm":
-                if hasattr(mod, "weight") and mod.weight is not None and mod.weight.is_meta is False:
+                if hasattr(mod, "weight") and mod.weight is not None and not mod.weight.is_meta:
                     torch.nn.init.ones_(mod.weight)
-            # MoE (custom)
             elif mod.__class__.__name__ == "MoE":
-                if hasattr(mod, "W_in") and not mod.W_in.is_meta: torch.nn.init.normal_(mod.W_in, 0.0, std)
-                if hasattr(mod, "W_out") and not mod.W_out.is_meta: torch.nn.init.normal_(mod.W_out, 0.0, std)
-                if hasattr(mod, "b_in") and not mod.b_in.is_meta: torch.nn.init.zeros_(mod.b_in)
-                if hasattr(mod, "b_out") and not mod.b_out.is_meta: torch.nn.init.zeros_(mod.b_out)
+                if hasattr(mod, "W_in") and not getattr(mod, "W_in").is_meta: torch.nn.init.normal_(mod.W_in, 0.0, std)
+                if hasattr(mod, "W_out") and not getattr(mod, "W_out").is_meta: torch.nn.init.normal_(mod.W_out, 0.0, std)
+                if hasattr(mod, "b_in") and not getattr(mod, "b_in").is_meta: torch.nn.init.zeros_(mod.b_in)
+                if hasattr(mod, "b_out") and not getattr(mod, "b_out").is_meta: torch.nn.init.zeros_(mod.b_out)
                 if hasattr(mod, "router"):
                     if hasattr(mod.router, "weight") and not mod.router.weight.is_meta:
                         torch.nn.init.normal_(mod.router.weight, 0.0, std)
                     if hasattr(mod.router, "bias") and mod.router.bias is not None and not mod.router.bias.is_meta:
                         torch.nn.init.zeros_(mod.router.bias)
-            # MultiheadSelfAttention (custom)
             elif mod.__class__.__name__ == "MultiheadSelfAttention":
                 for name in ("q","k","v","o"):
                     lin = getattr(mod, name, None)
@@ -250,13 +247,13 @@ def main():
                 if getattr(mod, "use_sink", False) and hasattr(mod, "sink_logit") and not mod.sink_logit.is_meta:
                     with torch.no_grad():
                         mod.sink_logit.fill_(float(getattr(getattr(m, "config", None), "sink_logit_init", 4.0)))
-        # RotaryEmbedding holds buffers; they’re computed on first forward.
+        # RotaryEmbedding buffers computed on first forward.
 
-    # FSDP (no device_id, no sync_module_states)
+    # FSDP
     model = FSDP(
         base_model,
         auto_wrap_policy=auto_wrap,
-        device_id=None,
+        device_id=None,                # let FSDP manage placement via to_empty
         mixed_precision=mp,
         use_orig_params=True,
         limit_all_gathers=True,
@@ -279,30 +276,94 @@ def main():
     val_loader   = BinLoader(args.data_dir, "val",   args.block_size, args.batch_size, device, seed=args.seed+1234+rank)
 
     # AMP
-    ctx = nullcontext() if "cpu" in device else torch.amp.autocast("cuda", dtype=mp_dtype)
+    ctx = nullcontext() if "cpu" in device else torch.autocast("cuda", dtype=mp_dtype)
     scaler = torch.amp.GradScaler("cuda", enabled=("cuda" in device and args.dtype == "float16"))
 
     # optim
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
 
-    # resume
-    ckpt_path = os.path.join(args.out_dir, "ckpt.pt")
-    iter_num = 0; best_val = float("inf")
-    if os.path.exists(ckpt_path):
+    # --------------- Checkpoint (SHARDED) ---------------
+    def sharded_ckpt_path(prefix: str, rank: int) -> str:
+        return os.path.join(args.out_dir, f"{prefix}_rank{rank:05d}.pt")
+
+    def save_ckpt_sharded(prefix: str, iter_n: int, best_v: float):
+        # All ranks save their shard (no rank0 gather)
+        rank = dist.get_rank() if is_dist() else 0
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.SHARDED_STATE_DICT,
+            state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
+            optim_state_dict_config=ShardedOptimStateDictConfig(offload_to_cpu=True),
+        ):
+            model_sd = model.state_dict()
+            optim_sd = FSDP.optim_state_dict(model, opt)
+
+        payload = {
+            "model_state_dict": model_sd,
+            "optimizer_state_dict": optim_sd,
+            "model_config_dict": dataclasses.asdict(model.module.config if hasattr(model, "module") else model.config),
+            "iter_num": iter_n,
+            "best_val_loss": best_v,
+            "tokenizer": tok_name,
+        }
+        path = sharded_ckpt_path(args.ckpt_prefix, rank)
+        torch.save(payload, path)
         if rank == 0:
-            rank0_print(f"[train] Resuming from {ckpt_path}")
-            payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            rank0_print(f"[ckpt] saved sharded prefix '{args.ckpt_prefix}' into {args.out_dir}/ ...rankXXXXX.pt")
         if is_dist(): dist.barrier()
-        if rank != 0: payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+
+    def load_ckpt_sharded(prefix: str):
+        # Each rank loads its shard
+        rank = dist.get_rank() if is_dist() else 0
+        path = sharded_ckpt_path(prefix, rank)
+        if not os.path.exists(path):
+            return None
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
             model.load_state_dict(payload["model_state_dict"])
-            shard_optim = FSDP.optim_state_dict_to_load(model, opt, payload["optimizer_state_dict"])
+        shard_optim = FSDP.optim_state_dict_to_load(payload["optimizer_state_dict"], model, opt)
         opt.load_state_dict(shard_optim)
         iter_num = int(payload.get("iter_num", 0))
-        best_val = float(payload.get("best_val_loss", best_val))
+        best_val = float(payload.get("best_val_loss", float("inf")))
         if is_dist(): dist.barrier()
-        rank0_print(f"[train] Resumed at iter {iter_num} (best val {best_val:.4f})")
+        if rank == 0:
+            rank0_print(f"[train] Resumed (sharded) at iter {iter_num} (best val {best_val:.4f})")
+        return iter_num, best_val
+
+    # ---- FULL checkpoint fallback (only if a single file ckpt.pt exists) ----
+    def load_ckpt_full(single_path: str):
+        if not os.path.exists(single_path):
+            return None
+        if rank == 0:
+            rank0_print(f"[train] Resuming from FULL {single_path}")
+            payload = torch.load(single_path, map_location="cpu", weights_only=False)
+        if is_dist(): dist.barrier()
+        if rank != 0:
+            payload = torch.load(single_path, map_location="cpu", weights_only=False)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            model.load_state_dict(payload["model_state_dict"])
+            shard_optim = FSDP.optim_state_dict_to_load(payload["optimizer_state_dict"], model, opt)
+        opt.load_state_dict(shard_optim)
+        iter_num = int(payload.get("iter_num", 0))
+        best_val = float(payload.get("best_val_loss", float("inf")))
+        if is_dist(): dist.barrier()
+        rank0_print(f"[train] Resumed (FULL) at iter {iter_num} (best val {best_val:.4f})")
+        return iter_num, best_val
+
+    # resume (prefer sharded if present)
+    iter_num = 0
+    best_val = float("inf")
+    sharded_first_rank = sharded_ckpt_path(args.ckpt_prefix, 0)
+    if os.path.exists(sharded_first_rank):
+        r = load_ckpt_sharded(args.ckpt_prefix)
+        if r is not None:
+            iter_num, best_val = r
+    else:
+        full_path = os.path.join(args.out_dir, "ckpt.pt")
+        r = load_ckpt_full(full_path)
+        if r is not None:
+            iter_num, best_val = r
 
     # LR sched
     def get_lr(it: int) -> float:
@@ -319,34 +380,13 @@ def main():
         with torch.no_grad():
             for _ in range(args.eval_iters):
                 Xv, Yv = val_loader.get_batch()
-                with ctx: _, out = model(Xv, labels=Yv)
+                with ctx:
+                    _, out = model(Xv, labels=Yv)
                 losses.append(out["loss"].item())
         model.train()
         val = torch.tensor([sum(losses)/max(1, len(losses))], device=device)
         if is_dist(): dist.all_reduce(val, op=dist.ReduceOp.AVG)
         return float(val.item())
-
-    # save (rank0)
-    def save_ckpt(path, iter_n, best_v):
-        if dist.is_initialized() and dist.get_rank() != 0:
-            if is_dist(): dist.barrier()
-            return
-        with FSDP.state_dict_type(
-            model, StateDictType.FULL_STATE_DICT,
-            state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-            optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            full_model_sd = model.state_dict()
-            full_optim_sd = FSDP.optim_state_dict(model, opt)
-        payload = {
-            "model_state_dict": full_model_sd,
-            "optimizer_state_dict": full_optim_sd,
-            "model_config_dict": dataclasses.asdict(model.module.config if hasattr(model, "module") else model.config),
-            "iter_num": iter_n, "best_val_loss": best_v, "tokenizer": tok_name,
-        }
-        torch.save(payload, path)
-        rank0_print(f"[ckpt] saved {path}")
-        if is_dist(): dist.barrier()
 
     # train loop
     t0 = time.time()
@@ -357,7 +397,9 @@ def main():
         opt.zero_grad(set_to_none=True); total_loss = 0.0
 
         for _ in range(args.grad_accum_steps):
-            with ctx: _, out = model(X, labels=Y); loss = out["loss"] / args.grad_accum_steps
+            with ctx:
+                _, out = model(X, labels=Y)
+                loss = out["loss"] / args.grad_accum_steps
             total_loss += float(loss.detach().item())
             if scaler.is_enabled(): scaler.scale(loss).backward()
             else: loss.backward()
@@ -370,7 +412,7 @@ def main():
         else: opt.step()
 
         if iter_num % args.log_interval == 0:
-            if "cuda" in device: torch.cuda.synchronize()
+            if "cuda" in str(device): torch.cuda.synchronize()
             loss_t = torch.tensor([total_loss], device=device)
             if is_dist(): dist.all_reduce(loss_t, op=dist.ReduceOp.AVG)
             dt = time.time() - t0; t0 = time.time()
@@ -382,20 +424,24 @@ def main():
             rank0_print(f"[eval] iter {iter_num}  val_loss {val:.4f}")
             if val < best_val:
                 best_val = val; rank0_print(f"[ckpt] new best {best_val:.4f}")
-                save_ckpt(ckpt_path, iter_num, best_val)
+                save_ckpt_sharded(args.ckpt_prefix, iter_num, best_val)
 
-        if (args.sample_every > 0 and iter_num > 0 and (iter_num % args.sample_every == 0)
-                and (not is_dist() or dist.get_rank() == 0)):
+        # IMPORTANT: all ranks must enter sampling to avoid FSDP deadlock
+        if args.sample_every > 0 and iter_num > 0 and (iter_num % args.sample_every == 0):
             try:
-                txt = sample_text(model, enc, device,
-                                  n_tokens=args.sample_tokens, temperature=args.temperature,
-                                  top_k=args.top_k, block_size=args.block_size, amp_dtype=mp_dtype)
-                print("\n--- SAMPLE ---"); print(txt); print("--------------\n")
+                txt = sample_text_collective(
+                    model, enc, device,
+                    n_tokens=args.sample_tokens, temperature=args.temperature,
+                    top_k=args.top_k, block_size=args.block_size, amp_dtype=mp_dtype
+                )
+                if (not is_dist()) or dist.get_rank() == 0:
+                    print("\n--- SAMPLE ---"); print(txt); print("--------------\n")
             except RuntimeError as e:
-                print(f"[sample] skipped due to error: {e}")
+                if (not is_dist()) or dist.get_rank() == 0:
+                    print(f"[sample] skipped due to error: {e}")
 
         if args.save_every > 0 and iter_num > 0 and (iter_num % args.save_every == 0):
-            save_ckpt(ckpt_path, iter_num, best_val)
+            save_ckpt_sharded(args.ckpt_prefix, iter_num, best_val)
 
         iter_num += 1
 
